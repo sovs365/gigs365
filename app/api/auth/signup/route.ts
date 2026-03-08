@@ -1,0 +1,134 @@
+import { NextRequest, NextResponse } from "next/server";
+import { hash } from "bcryptjs";
+import { prisma } from "@/lib/prisma";
+import { z } from "zod";
+import { Prisma } from "@prisma/client";
+
+const signupSchema = z.object({
+  username: z.string().min(3, "Username must be at least 3 characters").regex(/^[a-zA-Z0-9_-]+$/, "Username can only contain letters, numbers, underscores, and hyphens"),
+  phone: z.string().optional(),
+  password: z.string().min(8, "Password must be at least 8 characters"),
+  name: z.string().min(2, "Name must be at least 2 characters"),
+  role: z.enum(["FREELANCER", "CLIENT", "ADMIN"]).default("FREELANCER"),
+  adminCode: z.string().optional(), // For admin registration
+});
+
+export async function POST(request: NextRequest) {
+  try {
+    const body = await request.json();
+    const { username, phone, password, name, role, adminCode } = signupSchema.parse(body);
+
+    // Admin registration requires a code
+    if (role === "ADMIN") {
+      const expectedAdminCode = process.env.ADMIN_REGISTRATION_CODE || "110238870";
+      if (!adminCode || adminCode !== expectedAdminCode) {
+        return NextResponse.json(
+          { error: "Invalid admin registration code. Contact system administrators." },
+          { status: 403 }
+        );
+      }
+    }
+
+    // Check if username exists
+    const existingUser = await prisma.user.findUnique({
+      where: { username },
+    });
+
+    if (existingUser) {
+      return NextResponse.json(
+        { error: "Username already taken. Please choose a different username." },
+        { status: 400 }
+      );
+    }
+
+    // Check if email already exists (based on username)
+    const emailToUse = `${username}@taskhive.local`;
+    const existingEmail = await prisma.user.findUnique({
+      where: { email: emailToUse },
+    });
+
+    if (existingEmail) {
+      return NextResponse.json(
+        { error: "This username is already registered. Please try another." },
+        { status: 400 }
+      );
+    }
+
+    // Validate phone format if provided
+    if (phone && !/^\+?[0-9\s\-()]+$/.test(phone)) {
+      return NextResponse.json(
+        { error: "Invalid phone number format" },
+        { status: 400 }
+      );
+    }
+
+    // Hash password
+    const hashedPassword = await hash(password, 10);
+
+    // Create user with role
+    const user = await prisma.user.create({
+      data: {
+        username,
+        phone: phone || null,
+        password: hashedPassword,
+        name,
+        email: emailToUse,
+        role: role,
+      },
+    });
+
+    return NextResponse.json(
+      {
+        message: "User created successfully",
+        user: {
+          id: user.id,
+          name: user.name,
+          username: user.username,
+          phone: user.phone,
+          role: user.role,
+        },
+      },
+      { status: 201 }
+    );
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      const messages = error.errors.map((e) => e.message).join(", ");
+      return NextResponse.json(
+        { error: messages },
+        { status: 400 }
+      );
+    }
+
+    // Handle Prisma unique constraint errors
+    if (error instanceof Prisma.PrismaClientKnownRequestError) {
+      if (error.code === "P2002") {
+        const field = error.meta?.target as string[] | undefined;
+        const fieldName = field?.[0] || "field";
+        return NextResponse.json(
+          { error: `This ${fieldName} is already in use. Please try a different one.` },
+          { status: 400 }
+        );
+      }
+    }
+
+    // Log the actual error for debugging
+    console.error("Signup error:", error);
+
+    // Check if it's a database connection error
+    const errorMessage = String(error);
+    if (errorMessage.includes("Can't reach database") || errorMessage.includes("ECONNREFUSED")) {
+      return NextResponse.json(
+        {
+          error: "Database connection failed. Please check your DATABASE_URL in .env.local.",
+          details: errorMessage,
+        },
+        { status: 503 }
+      );
+    }
+
+    return NextResponse.json(
+      { error: "An error occurred during signup. Please try again later." },
+      { status: 500 }
+    );
+  }
+}
